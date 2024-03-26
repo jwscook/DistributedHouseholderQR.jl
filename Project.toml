@@ -1,0 +1,4 @@
+name = "DistributedHouseholderQR"
+uuid = "702a6613-ae54-43a5-b2a6-e982ad6f501e"
+authors = ["James Cook <cookjws@gmail.com>"]
+version = "0.1.0"
