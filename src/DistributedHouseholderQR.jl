@@ -203,10 +203,10 @@ function qr!(A)
   return H
 end
 
-function LinearAlgebra.:(\)(A::DistributedHouseholderQRStruct, b)
-  s = SharedArray(s)
+function LinearAlgebra.:(\)(H::DistributedHouseholderQRStruct, b)
+  s = SharedArray(b)
   solve_householder!(s, H.A, H.α)
-  return s
+  return s[1:size(H.A, 2)]
 end
 
 

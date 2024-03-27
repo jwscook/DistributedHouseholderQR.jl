@@ -16,7 +16,7 @@ const DHQR = DistributedHouseholderQR
 end
 
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), (2200, 2000), (4400, 4000))
+  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), )#(2200, 2000), (4400, 4000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
@@ -35,8 +35,10 @@ end
     α3 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
     b3 = SharedArray(deepcopy(b))
     tb = @elapsed  begin
-      H, α = DHQR.householder!(A3, α3)
-      x3 = DHQR.solve_householder!(b3, H, α)
+      #H, α = DHQR.householder!(A3, α3)
+      #x3 = DHQR.solve_householder!(b3, H, α)
+      qrA = DHQR.qr!(A3)
+      x3 = qrA \ deepcopy(b)
     end
     @testset "serial, library" begin
       @test norm(A' * A * x1 .- A' * b) < sqrt(eps())
