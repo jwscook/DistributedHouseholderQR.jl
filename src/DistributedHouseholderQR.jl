@@ -1,6 +1,6 @@
 module DistributedHouseholderQR
 
-using LinearAlgebra, DistributedArrays, SharedArrays
+using Distributed, LinearAlgebra, DistributedArrays, SharedArrays
 
 LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
 
@@ -45,8 +45,8 @@ Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j .- lcb.Δj]
 Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j .- lcb.Δj]
 
 function householder!(A, α=zeros(eltype(A), size(A, 2)))
-  for n in procs(A)
-    A, α = fetch(@spawnat n _householder!(A, α))
+  for p in procs(A)
+    A, α = fetch(@spawnat p _householder!(A, α))
   end
   (A, α)
 end
@@ -76,13 +76,9 @@ function _householder!(H, α)
       Hl[i, j] *= f
     end
     Hj .= Hl[:, j] # copying this will make all data in end loop local
-    for n in procs(H)
-      all(<(j), columnblocks(H, n)) && continue
-      if n == myid()
-        _householder_inner!(H, j, Hj)
-      else
-        wait(@spawnat n _householder_inner!(H, j, Hj))
-      end
+    for p in procs(H)
+      j > columnblocks(H, p)[end] && continue
+      wait(@spawnat p _householder_inner!(H, j, Hj))
     end
   end
   return (H, α)
