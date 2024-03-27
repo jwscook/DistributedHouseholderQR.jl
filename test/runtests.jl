@@ -4,7 +4,7 @@ Random.seed!(0)
 
 using DistributedHouseholderQR
 const DQHR = DistributedHouseholderQR
-addprocs(2, exeflags=["--proj=@.","-t 2"])
+addprocs(2, exeflags=["--proj=@.","-t 4"])
 @everywhere using Test
 @everywhere begin
 using LinearAlgebra, Random, Test
@@ -16,8 +16,7 @@ const DHQR = DistributedHouseholderQR
 end
 
 @testset "Distributed Householder QR" begin
-
-  for T in (ComplexF64, ), mn in ((12, 8), (2200, 2000))
+  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), (2200, 2000), (4400, 4000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
@@ -33,8 +32,8 @@ end
     end
     # distribute A across columns
     A3 = DArray(ij->A[ij[1], ij[2]], size(A), workers(), (1, nworkers()))
-     α3 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
-     b3 = SharedArray(deepcopy(b))
+    α3 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
+    b3 = SharedArray(deepcopy(b))
     tb = @elapsed  begin
       H, α = DHQR.householder!(A3, α3)
       x3 = DHQR.solve_householder!(b3, H, α)
