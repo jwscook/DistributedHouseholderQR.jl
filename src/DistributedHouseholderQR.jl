@@ -45,19 +45,12 @@ Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j .- lcb.Δj]
 Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j .- lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 
-function householder!(A, α)
-  for p in procs(A)
-    A, α = fetch(@spawnat p _householder!(A, α))
-  end
-  (A, α)
-end
-
 @inline function partialdot(v, A, is, j)
-  s = if length(is) < 512
+  s = if length(is) < 32
     dot(v[is], A[is, j])
   else
     s = zero(eltype(A))
-    @inbounds @batch minbatch=512 reduction=(+,s) for i in is
+    @inbounds @batch minbatch=32 reduction=(+,s) for i in is
       s += conj(v[i]) * A[i, j]
     end
     s
@@ -65,16 +58,11 @@ end
   return s
 end
 
-function _householder_inner!(H, j, Hj)
-  m, n = size(H)
-  Hl = LocalColumnBlock(H)
-  @inbounds @views for jj in intersect(j+1:n, Hl.colrange)
-    s = partialdot(Hj, Hl, j:m, jj)
-    @batch per=core minbatch=256 for i in j:m
-      Hl[i, jj] -= Hj[i] * s
-    end
+function householder!(A, α)
+  for p in procs(A)
+    A, α = fetch(@spawnat p _householder!(A, α))
   end
-  return Hl
+  (A, α)
 end
 
 function _householder!(H, α)
@@ -85,50 +73,42 @@ function _householder!(H, α)
   @inbounds @views for j in Hl.colrange
     t1a += @elapsed begin
     s = norm(Hl[j:m, j])
-    #s = zero(real(eltype(Hl)))
-    #@batch for i in j:m
-    #  Hlij = Hj[i, j]
-    #  s += real(conj(Hlij) * Hlij)
-    #end
-    #s = sqrt(s)
     α[j] = s * alphafactor(Hl[j, j])
     f = 1 / sqrt(s * (s + abs(Hl[j, j])))
     Hl[j, j] -= α[j]
-    #=@batch minbatch=1024=# for i in j:m
+    for i in j:m
       Hl[i, j] *= f
     end
     end
     t1b += @elapsed begin
-    Hj .= Hl[:, j] # copying this will make all data in end loop local
+    @. Hj = Hl[:, j] # copying this will make all data in end loop local
     for p in procs(H)
       j > columnblocks(H, p)[end] && continue
       wait(@spawnat p _householder_inner!(H, j, Hj))
     end
     end
   end
-  @show t1a, t1b
+  #@show t1a, t1b
   return (H, α)
 end
 
-function _solve_householder1_inner!(b, H, α)
+function _householder_inner!(H, j, Hj)
   m, n = size(H)
-  # multuply by Q' ...
   Hl = LocalColumnBlock(H)
-  @inbounds @views for j in intersect(1:n, Hl.colrange)
-    s = dot(Hl[j:m, j], b[j:m])
-#    s = conj(partialdot(b, Hl, j:m, j))
-    #=@batch minbatch=512=# for i in j:m
-      b[i] -= Hl[i, j] * s
+  @batch per=core minbatch=32 for jj in intersect(j+1:n, Hl.colrange)
+    s = dot(Hj[j:m], Hl[j:m, jj])
+    for i in j:m
+      Hl[i, jj] -= Hj[i] * s
     end
   end
+  return Hl
 end
 
 function _solve_householder1!(b::Vector, H, α::Vector)
   m, n = size(H)
-  @inbounds @views for j in 1:n
+  for j in 1:n
     s = dot(H[j:m, j], b[j:m])
-#    s = conj(partialdot(b, H, j:m, j))
-    @batch per=core minbatch=512 for i in j:m
+    @batch for i in j:m
       b[i] -= H[i, j] * s
     end
   end
@@ -141,27 +121,28 @@ function _solve_householder1!(b::SharedArray, H, α)
   end
 end
 
+function _solve_householder1_inner!(b, H, α)
+  m, n = size(H)
+  # multuply by Q' ...
+  Hl = LocalColumnBlock(H)
+  for j in intersect(1:n, Hl.colrange)
+    s = dot(Hl[j:m, j], b[j:m])
+#    s = conj(partialdot(b, Hl, j:m, j))
+    @batch per=core minbatch=32 for i in j:m
+      b[i] -= Hl[i, j] * s
+    end
+  end
+end
+
 function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
   @inbounds @views for i in n:-1:1
     bi = b[i]
-    @batch per=core minbatch=512 reduction=(-,bi) for j in i+1:n
+    @batch per=core minbatch=32 reduction=(-,bi) for j in i+1:n
       bi -= H[i, j] * b[j]
     end
     b[i] = bi / α[i]
   end
-  return b
-end
-
-function _solve_householder2_inner!(b, H, i)
-  m, n = size(H)
-  Hl = LocalColumnBlock(H)
-  js = intersect(i+1:n, Hl.colrange)
-  isempty(js) && return b
-  @inbounds @views for j in js
-    b[i] -= Hl[i, j] * b[j]
-  end
-#  @inbounds @views b[i] -= dot(conj.(b[js]), Hl[i, js])
   return b
 end
 
@@ -179,14 +160,28 @@ function _solve_householder2!(b::SharedArray, H, α)
   return b
 end
 
+function _solve_householder2_inner!(b, H, i)
+  m, n = size(H)
+  Hl = LocalColumnBlock(H)
+  js = intersect(i+1:n, Hl.colrange)
+  isempty(js) && return b
+  bi = zero(promote_type(eltype(b), eltype(Hl)))
+  @batch per=core minbatch=32 reduction=(+,bi) for j in js
+    bi += Hl[i, j] * b[j]
+   end
+  b[i] -= bi
+  return b
+end
+
 function solve_householder!(b, H, α)
+  # H is the matrix A that has undergone householder!(A, α)
   m, n = size(H)
   # multuply by Q' ...
   _solve_householder1!(b, H, α)
   # now that b holds the value of Q'b
   # we may back sub with R
   t2 = @elapsed _solve_householder2!(b, H, α)
-  @show t2
+  #@show t2
   return b[1:n]
 end
 
@@ -194,10 +189,12 @@ struct DistributedHouseholderQRStruct{T1, T2}
   A::T1
   α::T2
 end
+
 function DistributedHouseholderQRStruct(A::DArray)
   α = SharedArray(zeros(eltype(A), size(A, 2)))
   return DistributedHouseholderQRStruct(A, α)
 end
+
 function DistributedHouseholderQRStruct(A)
   α = zeros(eltype(A), size(A, 2))
   return DistributedHouseholderQRStruct(A, α)
