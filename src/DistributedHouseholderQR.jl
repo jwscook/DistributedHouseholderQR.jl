@@ -38,19 +38,18 @@ function LocalColumnBlock(A::AbstractVector)
   Δj = colrange[1] - 1
   return LocalColumnBlock(localblock(A), Δj, colrange)
 end
-Base.setindex!(lcb::LocalColumnBlock, v::Number, i, j) = (lcb.Al[i, j .- lcb.Δj] = v)
-Base.setindex!(lcb::LocalColumnBlock, v, i, j) = (lcb.Al[i, j .- lcb.Δj] = v)
-Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j .- lcb.Δj] = v)
-Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j .- lcb.Δj]
-Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j .- lcb.Δj]
+Base.setindex!(lcb::LocalColumnBlock, v::Number, i, j) = (lcb.Al[i, j - lcb.Δj] = v)
+Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j - lcb.Δj] = v)
+Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
+Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 
 @inline function partialdot(v, A, is, j)
-  s = if length(is) < 32
+  s = if length(is) < 64
     dot(v[is], A[is, j])
   else
     s = zero(eltype(A))
-    @inbounds @batch minbatch=32 reduction=(+,s) for i in is
+    @inbounds @batch minbatch=64 reduction=(+,s) for i in is
       s += conj(v[i]) * A[i, j]
     end
     s
@@ -95,7 +94,7 @@ end
 function _householder_inner!(H, j, Hj)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  @batch per=core minbatch=32 for jj in intersect(j+1:n, Hl.colrange)
+  @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
     s = dot(Hj[j:m], Hl[j:m, jj])
     for i in j:m
       Hl[i, jj] -= Hj[i] * s
@@ -128,7 +127,7 @@ function _solve_householder1_inner!(b, H, α)
   for j in intersect(1:n, Hl.colrange)
     s = dot(Hl[j:m, j], b[j:m])
 #    s = conj(partialdot(b, Hl, j:m, j))
-    @batch per=core minbatch=32 for i in j:m
+    @batch per=core minbatch=64 for i in j:m
       b[i] -= Hl[i, j] * s
     end
   end
@@ -138,7 +137,7 @@ function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
   @inbounds @views for i in n:-1:1
     bi = b[i]
-    @batch per=core minbatch=32 reduction=(-,bi) for j in i+1:n
+    @batch per=core minbatch=64 reduction=(-,bi) for j in i+1:n
       bi -= H[i, j] * b[j]
     end
     b[i] = bi / α[i]
@@ -166,7 +165,7 @@ function _solve_householder2_inner!(b, H, i)
   js = intersect(i+1:n, Hl.colrange)
   isempty(js) && return b
   bi = zero(promote_type(eltype(b), eltype(Hl)))
-  @batch per=core minbatch=32 reduction=(+,bi) for j in js
+  @batch per=core minbatch=64 reduction=(+,bi) for j in js
     bi += Hl[i, j] * b[j]
    end
   b[i] -= bi
