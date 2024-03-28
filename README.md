@@ -1,3 +1,3 @@
 # DistributedHouseholderQR.jl
 
-Solve your distributed linear algebra problems in pure julia. 
+Solve your distributed linear algebra problems in pure julia, slowly...
