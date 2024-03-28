@@ -53,11 +53,11 @@ function householder!(A, α)
 end
 
 @inline function partialdot(v, A, is, j)
-  s = if length(is) < 256
+  s = if length(is) < 512
     dot(v[is], A[is, j])
   else
     s = zero(eltype(A))
-    @inbounds @batch reduction=(+,s) for i in is
+    @inbounds @batch minbatch=512 reduction=(+,s) for i in is
       s += conj(v[i]) * A[i, j]
     end
     s
@@ -70,7 +70,7 @@ function _householder_inner!(H, j, Hj)
   Hl = LocalColumnBlock(H)
   @inbounds @views for jj in intersect(j+1:n, Hl.colrange)
     s = partialdot(Hj, Hl, j:m, jj)
-    @batch for i in j:m
+    @batch per=core minbatch=256 for i in j:m
       Hl[i, jj] -= Hj[i] * s
     end
   end
@@ -85,10 +85,16 @@ function _householder!(H, α)
   @inbounds @views for j in Hl.colrange
     t1a += @elapsed begin
     s = norm(Hl[j:m, j])
+    #s = zero(real(eltype(Hl)))
+    #@batch for i in j:m
+    #  Hlij = Hj[i, j]
+    #  s += real(conj(Hlij) * Hlij)
+    #end
+    #s = sqrt(s)
     α[j] = s * alphafactor(Hl[j, j])
     f = 1 / sqrt(s * (s + abs(Hl[j, j])))
     Hl[j, j] -= α[j]
-    #=@batch=# for i in j:m
+    #=@batch minbatch=1024=# for i in j:m
       Hl[i, j] *= f
     end
     end
@@ -111,7 +117,7 @@ function _solve_householder1_inner!(b, H, α)
   @inbounds @views for j in intersect(1:n, Hl.colrange)
     s = dot(Hl[j:m, j], b[j:m])
 #    s = conj(partialdot(b, Hl, j:m, j))
-    #=@batch=# for i in j:m
+    #=@batch minbatch=512=# for i in j:m
       b[i] -= Hl[i, j] * s
     end
   end
@@ -122,7 +128,7 @@ function _solve_householder1!(b::Vector, H, α::Vector)
   @inbounds @views for j in 1:n
     s = dot(H[j:m, j], b[j:m])
 #    s = conj(partialdot(b, H, j:m, j))
-    #=@batch=# for i in j:m
+    @batch per=core minbatch=512 for i in j:m
       b[i] -= H[i, j] * s
     end
   end
@@ -139,7 +145,7 @@ function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
   @inbounds @views for i in n:-1:1
     bi = b[i]
-    @batch per=core reduction=(-,bi) for j in i+1:n
+    @batch per=core minbatch=512 reduction=(-,bi) for j in i+1:n
       bi -= H[i, j] * b[j]
     end
     b[i] = bi / α[i]

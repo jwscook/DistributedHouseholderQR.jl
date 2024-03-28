@@ -4,11 +4,15 @@ Random.seed!(0)
 
 using DistributedHouseholderQR
 const DQHR = DistributedHouseholderQR
-addprocs(2, exeflags=["--proj=@.","-t 4"])
+addprocs(2, exeflags=["--proj=@.","-t 10"])
 @everywhere using Test
 @everywhere begin
 using LinearAlgebra, Random, Test
 using Distributed, DistributedArrays, SharedArrays
+using ThreadPinning
+@static if Sys.islinux()
+  ThreadPinning.pinthreads(:cores)
+end
 using DistributedHouseholderQR
 LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
 
@@ -16,7 +20,7 @@ const DHQR = DistributedHouseholderQR
 end
 
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), )#(2200, 2000), (4400, 4000))
+  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), (2200, 2000), (4400, 4000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
