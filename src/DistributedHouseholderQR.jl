@@ -43,6 +43,7 @@ Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j - lcb.Δj] = v)
 Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
 Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
+Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
 
 @inline function partialdot(v, A, is, j)
   s = if length(is) < 64
@@ -81,7 +82,7 @@ function _householder!(H, α)
     end
     t1b += @elapsed begin
     @. Hj = Hl[:, j] # copying this will make all data in end loop local
-    for p in procs(H)
+    for p in procs(H) # this is most expensive
       j > columnblocks(H, p)[end] && continue
       wait(@spawnat p _householder_inner!(H, j, Hj))
     end
@@ -95,8 +96,8 @@ function _householder_inner!(H, j, Hj)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
   @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
-    s = dot(Hj[j:m], Hl[j:m, jj])
-    for i in j:m
+    s = dot(view(Hj, j:m), view(Hl, j:m, jj))
+    @inbounds for i in j:m
       Hl[i, jj] -= Hj[i] * s
     end
   end
@@ -108,7 +109,7 @@ function _solve_householder1!(b::Vector, H, α::Vector)
   for j in 1:n
     s = dot(H[j:m, j], b[j:m])
     @batch for i in j:m
-      b[i] -= H[i, j] * s
+      @inbounds b[i] -= H[i, j] * s
     end
   end
   return b
@@ -124,11 +125,11 @@ function _solve_householder1_inner!(b, H, α)
   m, n = size(H)
   # multuply by Q' ...
   Hl = LocalColumnBlock(H)
-  for j in intersect(1:n, Hl.colrange)
+  @views for j in intersect(1:n, Hl.colrange)
     s = dot(Hl[j:m, j], b[j:m])
 #    s = conj(partialdot(b, Hl, j:m, j))
     @batch per=core minbatch=64 for i in j:m
-      b[i] -= Hl[i, j] * s
+      @inbounds b[i] -= Hl[i, j] * s
     end
   end
 end
@@ -166,8 +167,8 @@ function _solve_householder2_inner!(b, H, i)
   isempty(js) && return b
   bi = zero(promote_type(eltype(b), eltype(Hl)))
   @batch per=core minbatch=64 reduction=(+,bi) for j in js
-    bi += Hl[i, j] * b[j]
-   end
+    @inbounds bi += Hl[i, j] * b[j]
+  end
   b[i] -= bi
   return b
 end

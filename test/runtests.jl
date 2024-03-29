@@ -11,6 +11,7 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
 using LinearAlgebra, Random, Test
 using Distributed, DistributedArrays, SharedArrays
 using ThreadPinning
+ThreadPinning.Prefs.set_os_warning(false)
 @static if Sys.islinux()
   ThreadPinning.pinthreads(:cores)
 end
@@ -21,7 +22,7 @@ const DHQR = DistributedHouseholderQR
 end
 
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in ((11, 10), (1100, 1000), (2200, 2000), (4400, 4000))
+  for T in (ComplexF64, ), mn in ((11, 10), (550, 500), (1100, 1000), (2200, 2000), (4400, 4000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
