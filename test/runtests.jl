@@ -1,4 +1,5 @@
 using Random, Distributed, Base.Threads
+using BenchmarkTools
 
 const np = try parse(Int, ARGS[1]); catch; 2; end
 
@@ -19,34 +20,50 @@ using DistributedHouseholderQR
 LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
 
 const DHQR = DistributedHouseholderQR
+splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
+lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
+hirange(np, N, p) = min(N, splits(np, N, p))
 end
 
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in ((11, 10), (550, 500), (1100, 1000), (2200, 2000), (4400, 4000))
+  for T in (ComplexF64, ), mn in ((11, 10), (550, 500), (1100, 1000), (2200, 2000),)# (4400, 4000), (8800, 8000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
     A1 = deepcopy(Matrix(A))
     b1 = deepcopy(Vector(b))
-    tl = @elapsed x1 = LinearAlgebra.qr!(A1, NoPivot()) \ b1
+    x1 = LinearAlgebra.qr!(A1, NoPivot()) \ b1
+    bm1 =@benchmark LinearAlgebra.qr!($(deepcopy(A))) \ $(deepcopy(b))
+    tl = mean(bm1).time / 1e9
     println("The stdlib took $tl seconds for m=$m and n=$n")
     A2 = deepcopy(Matrix(A))
     b2 = deepcopy(Vector(b))
+    _A2 = deepcopy(Matrix(A))
+    _b2 = deepcopy(Vector(b))
     ta = @elapsed begin
       α2 = zeros(T, n)
 #      H, α = DHQR.householder!(A2, α2)
 #      x2 = DHQR.solve_householder!(b2, H, α)
       x2 = DHQR.qr!(A2) \ b2
+      bm2 = @benchmark DHQR.qr!($(deepcopy(_A2))) \ $(_b2)
+      @show bm2
     end
     # distribute A across columns
     A3 = DArray(ij->A[ij[1], ij[2]], size(A), workers(), (1, nworkers()))
+    #ras = [@spawnat workers()[i] A[:, lorange(np, n, i):hirange(np, n, i)] for i in 1:np]
+    #A3 = DArray(reshape(ras, (1, nworkers())))
+
     α3 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
     b3 = SharedArray(deepcopy(b))
+    _A3 = deepcopy(A3)
+    _b3 = SharedArray(deepcopy(b))
     tb = @elapsed  begin
       #H, α = DHQR.householder!(A3, α3)
       #x3 = DHQR.solve_householder!(b3, H, α)
       qrA = DHQR.qr!(A3)
       x3 = qrA \ deepcopy(b)
+      #bm3 = @benchmark DHQR.qr!($(deepcopy(_A3))) \ $(deepcopy(b))
+      #@show bm3
     end
     @testset "stlib (threaded)" begin
       @test norm(A' * A * x1 .- A' * b) < sqrt(eps())
