@@ -75,8 +75,8 @@ Base.view(lrb::LocalRowBlock, i, j) = view(lib.Al, i - lcb.Δ, j)
 
 function LocalBlock(A)
   rowrange, colrange = localindexes(A)
-  colrange == 1:size(A, 2) && return LocalRowBlock(A)
   rowrange == 1:size(A, 1) && return LocalColumnBlock(A)
+  colrange == 1:size(A, 2) && return LocalRowBlock(A)
   throw(ArgumentError("Distribution of indices not implementd"))
 end
 
@@ -101,9 +101,10 @@ function householder!(A, α)
   (A, α)
 end
 
-function _householder!(H, α)
+_householder!(H, α) = _householder!(H, α, LocalBlock(H))
+
+function _householder!(H, α, Hl::LocalColumnBlock)
   m, n = size(H)
-  Hl = LocalColumnBlock(H)
   Hj = zeros(eltype(H), m)
   t1a = t1b = 0.0
   @inbounds @views for j in Hl.colrange
@@ -120,7 +121,7 @@ function _householder!(H, α)
     @. Hj = Hl[:, j] # copying this will make all data in end loop local
     @sync for p in procs(H) # this is most expensive
       #j > columnblocks(H, p)[end] && continue
-      @spawnat p _householder_inner!(H, j, Hj)
+      @spawnat p _householder_inner_localcolumnblock!(H, j, Hj)
     end
     end
   end
@@ -128,7 +129,7 @@ function _householder!(H, α)
   return (H, α)
 end
 
-function _householder_inner!(H, j, Hj)
+function _householder_inner_localcolumnblock!(H, j, Hj)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
   @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
@@ -138,6 +139,10 @@ function _householder_inner!(H, j, Hj)
     end
   end
   return Hl
+end
+
+function _householder_inner_localrowblock!(H, j, Hj)
+
 end
 
 function _solve_householder1!(b::Vector, H, α::Vector)
@@ -158,9 +163,12 @@ function _solve_householder1!(b::SharedArray, H, α)
 end
 
 function _solve_householder1_inner!(b, H, α)
+  return _solve_householder1_inner!(b, H, α, LocalBlock(H))
+end
+
+function _solve_householder1_inner!(b, H, α, Hl::LocalColumnBlock)
   m, n = size(H)
   # multuply by Q' ...
-  Hl = LocalColumnBlock(H)
   @views for j in intersect(1:n, Hl.colrange)
     s = dot(Hl[j:m, j], b[j:m])
 #    s = conj(partialdot(b, Hl, j:m, j))
@@ -169,6 +177,7 @@ function _solve_householder1_inner!(b, H, α)
     end
   end
 end
+
 
 function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
@@ -197,8 +206,10 @@ function _solve_householder2!(b::SharedArray, H, α)
 end
 
 function _solve_householder2_inner!(b, H, i)
+  return _solve_householder2_inner!(b, H, i, LocalBlock(H))
+end
+function _solve_householder2_inner!(b, H, i, Hl::LocalColumnBlock)
   m, n = size(H)
-  Hl = LocalColumnBlock(H)
   js = intersect(i+1:n, Hl.colrange)
   isempty(js) && return b
   bi = zero(promote_type(eltype(b), eltype(Hl)))
