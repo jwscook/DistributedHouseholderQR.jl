@@ -22,28 +22,64 @@ localblock(A::DArray) = localpart(A)
 localblock(A::SharedArray) = A
 localblock(A::AbstractArray) = A
 
-struct LocalColumnBlock{T}
+abstract type AbstractLocalBlock end
+
+struct LocalColumnBlock{T} <: AbstractLocalBlock
   Al::T
+  Δi::Int
   Δj::Int
+  rowrange::UnitRange{Int}
   colrange::UnitRange{Int}
 end
 function LocalColumnBlock(A::AbstractMatrix)
   rowrange, colrange = localindexes(A)
   @assert rowrange == 1:size(A, 1)
+  Δi = rowrange[1] - 1
   Δj = colrange[1] - 1
-  return LocalColumnBlock(localblock(A), Δj, colrange)
+  return LocalColumnBlock(localblock(A), Δi, Δj, rowrange, colrange)
 end
-function LocalColumnBlock(A::AbstractVector)
-  colrange = localindexes(H)[1]
-  Δj = colrange[1] - 1
-  return LocalColumnBlock(localblock(A), Δj, colrange)
-end
+#function LocalColumnBlock(A::AbstractVector)
+#  colrange = localindexes(H)[2]
+#  Δj = colrange[1] - 1
+#  return LocalColumnBlock(localblock(A), Δj, colrange)
+#end
 Base.setindex!(lcb::LocalColumnBlock, v::Number, i, j) = (lcb.Al[i, j - lcb.Δj] = v)
-Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j - lcb.Δj] = v)
+#Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j - lcb.Δj] = v)
 Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
-Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j - lcb.Δj]
+#Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
+
+struct LocalRowBlock{T} <: AbstractLocalBlock
+  Al::T
+  Δi::Int
+  rowrange::UnitRange{Int}
+end
+function LocalRowBlock(A::AbstractMatrix)
+  rowrange, colrange = localindexes(A)
+  @assert colrange == 1:size(A, 2)
+  Δi = rowrange[1] - 1
+  return LocalRowBlock(localblock(A), Δi, rowrange)
+end
+function LocalRowBlock(A::AbstractVector)
+  rowrange = localindexes(H)[1]
+  Δi = rowrange[1] - 1
+  return LocalRowBlock(localblock(A), Δi, rowrange)
+end
+Base.setindex!(lrb::LocalRowBlock, v::Number, i, j) = (lrb.Al[i - lrb.Δi, j] = v)
+Base.setindex!(lrb::LocalRowBlock, v, j) = (lrb.Al[i - lrb.Δi] = v)
+Base.getindex(lrb::LocalRowBlock, i, j) = lrb.Al[i - lrb.Δi, j]
+Base.getindex(lrb::LocalRowBlock, i) = lib.Al[i - lcb.Δi, j]
+Base.eltype(lrb::LocalRowBlock) = eltype(lib.Al)
+Base.view(lrb::LocalRowBlock, i, j) = view(lib.Al, i - lcb.Δ, j)
+
+function LocalBlock(A)
+  rowrange, colrange = localindexes(A)
+  colrange == 1:size(A, 2) && return LocalRowBlock(A)
+  rowrange == 1:size(A, 1) && return LocalColumnBlock(A)
+  throw(ArgumentError("Distribution of indices not implementd"))
+end
+
 
 @inline function partialdot(v, A, is, j)
   s = if length(is) < 64
