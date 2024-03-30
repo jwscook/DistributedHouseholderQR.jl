@@ -82,9 +82,9 @@ function _householder!(H, α)
     end
     t1b += @elapsed begin
     @. Hj = Hl[:, j] # copying this will make all data in end loop local
-    for p in procs(H) # this is most expensive
-      j > columnblocks(H, p)[end] && continue
-      wait(@spawnat p _householder_inner!(H, j, Hj))
+    @sync for p in procs(H) # this is most expensive
+      #j > columnblocks(H, p)[end] && continue
+      @spawnat p _householder_inner!(H, j, Hj)
     end
     end
   end
@@ -116,7 +116,7 @@ function _solve_householder1!(b::Vector, H, α::Vector)
 end
 
 function _solve_householder1!(b::SharedArray, H, α)
-  @sync for p in procs(H)
+  for p in procs(H)
     wait(@spawnat p _solve_householder1_inner!(b, H, α))
   end
 end
@@ -151,7 +151,7 @@ function _solve_householder2!(b::SharedArray, H, α)
   ps = procs(H)
   ps = length(ps) == 1 ? ps : reverse(ps)
   @inbounds @views for i in n:-1:1
-    @sync for p in ps
+    for p in ps
       i > columnblocks(H, p)[end] && continue
       wait(@spawnat p _solve_householder2_inner!(b, H, i))
     end
