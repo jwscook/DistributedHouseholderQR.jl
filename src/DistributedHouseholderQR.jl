@@ -14,13 +14,25 @@ localindexes(A::AbstractArray) = Tuple(1:i for i in size(A))
 localindexes(A::DArray) = DistributedArrays.localindices(A)
 localindexes(A::SharedArray) = SharedArrays.localindices(A)
 
-columnblocks(m::AbstractArray, n) = (@assert n == 1; return 1:size(m, 2))
-columnblocks(m::DArray, n) = m.indices[n - m.pids[1] + 1][2]
+
+rowcolumnblocks(A::AbstractArray, p, i) = (@assert p == 1; return 1:size(A, i))
+rowcolumnblocks(A::DArray, p, i) = A.indices[p - A.pids[1] + 1][i]
+rowblocks(A, p) = rowcolumnblocks(A, p, 1)
+columnblocks(A, p) = rowcolumnblocks(A, p, 2)
 Distributed.procs(::AbstractArray) = 1
 
 localblock(A::DArray) = localpart(A)
 localblock(A::SharedArray) = A
 localblock(A::AbstractArray) = A
+
+isdistributedbycolumns(A) = true#false
+function isdistributedbycolumns(A::DArray)
+  for p in A.pids
+    rowblocks(A, p) == 1:size(A, 1) || return false
+  end
+  return true
+end
+isdistributedbyrows(A) = !isdistributedbycolumns(A)
 
 abstract type AbstractLocalBlock end
 
@@ -57,7 +69,7 @@ struct LocalRowBlock{T} <: AbstractLocalBlock
 end
 function LocalRowBlock(A::AbstractMatrix)
   rowrange, colrange = localindexes(A)
-  @assert colrange == 1:size(A, 2)
+  @assert colrange == 1:size(A, 2) colrange size(A)
   Δi = rowrange[1] - 1
   return LocalRowBlock(localblock(A), Δi, rowrange)
 end
@@ -69,9 +81,9 @@ end
 Base.setindex!(lrb::LocalRowBlock, v::Number, i, j) = (lrb.Al[i - lrb.Δi, j] = v)
 Base.setindex!(lrb::LocalRowBlock, v, j) = (lrb.Al[i - lrb.Δi] = v)
 Base.getindex(lrb::LocalRowBlock, i, j) = lrb.Al[i - lrb.Δi, j]
-Base.getindex(lrb::LocalRowBlock, i) = lib.Al[i - lcb.Δi, j]
-Base.eltype(lrb::LocalRowBlock) = eltype(lib.Al)
-Base.view(lrb::LocalRowBlock, i, j) = view(lib.Al, i - lcb.Δ, j)
+Base.getindex(lrb::LocalRowBlock, i) = lrb.Al[i - lrb.Δi, j]
+Base.eltype(lrb::LocalRowBlock) = eltype(lrb.Al)
+Base.view(lrb::LocalRowBlock, i, j) = view(lrb.Al, i - lrb.Δ, j)
 
 function LocalBlock(A)
   rowrange, colrange = localindexes(A)
@@ -129,6 +141,48 @@ function _householder!(H, α, Hl::LocalColumnBlock)
   return (H, α)
 end
 
+function _householder!(H, α, Hl::LocalRowBlock)
+  m, n = size(H)
+  Hj = zeros(eltype(H), m)
+  t1a = t1b = 0.0
+  @inbounds @views for j in intersect(1:n, Hl.rowrange)
+    t1a += @elapsed begin
+    s = norm(Hl[j:m, j])
+    α[j] = s * alphafactor(Hl[j, j])
+    f = 1 / sqrt(s * (s + abs(Hl[j, j])))
+    Hl[j, j] -= α[j]
+    #for i in j:m
+    #  Hl[i, j] *= f
+    #end
+    @sync for p in procs(H) # this is most expensive
+      @spawnat p begin
+        Hp = LocalRowBlock(H)
+        is = intersect(j:m, Hp.rowrange)
+        for i in is
+          Hl[i, j] *= f
+        end
+      end
+    end
+    end
+    t1b += @elapsed begin
+    @. Hj = H[:, j] # dog slow?
+    @sync for p in procs(H) # this is most expensive
+      @spawnat p begin
+        Hp = LocalRowBlock(H)
+        @batch per=core minbatch=64 for jj in j+1:n
+          s = dot(view(Hj, j:m), view(H, j:m, jj)) # dog slow?
+          @inbounds for i in j:m
+            Hp[i, jj] -= Hj[i] * s
+          end
+        end
+      end
+    end
+    end
+  end
+  #@show t1a, t1b
+  return (H, α)
+end
+
 function _householder_inner_localcolumnblock!(H, j, Hj)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
@@ -139,10 +193,6 @@ function _householder_inner_localcolumnblock!(H, j, Hj)
     end
   end
   return Hl
-end
-
-function _householder_inner_localrowblock!(H, j, Hj)
-
 end
 
 function _solve_householder1!(b::Vector, H, α::Vector)
@@ -178,6 +228,22 @@ function _solve_householder1_inner!(b, H, α, Hl::LocalColumnBlock)
   end
 end
 
+function _solve_householder1_inner!(b, H, α, Hl::LocalRowBlock)
+  m, n = size(H)
+  # multuply by Q' ...
+  @views for j in 1:n
+    s = dot(H[j:m, j], b[j:m]) # slow
+    for p in procs(H)
+      wait(@spawnat p begin
+        Hl = LocalRowBlock(H)
+        for i in intersec(j:m, Hl.rowrange)
+          @inbounds b[i] -= Hl[i, j] * s
+        end
+      end)
+    end
+  end
+end
+
 
 function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
@@ -192,33 +258,57 @@ function _solve_householder2!(b::Vector, H, α::Vector)
 end
 
 function _solve_householder2!(b::SharedArray, H, α)
+  if isdistributedbycolumns(H)
+    return _solve_householder2_columns!(b::SharedArray, H, α)
+  elseif isdistributedbyrows(H)
+    return _solve_householder2_rows!(b::SharedArray, H, α)
+  else
+    throw(error("Not implemented"))
+  end
+end
+function _solve_householder2_columns!(b::SharedArray, H, α)
+
   m, n = size(H)
   ps = procs(H)
   ps = length(ps) == 1 ? ps : reverse(ps)
   @inbounds @views for i in n:-1:1
     for p in ps
-      i > columnblocks(H, p)[end] && continue
-      wait(@spawnat p _solve_householder2_inner!(b, H, i))
+      wait(@spawnat p begin
+        Hl = LocalColumnBlock(H)
+        js = intersect(i+1:n, Hl.colrange)
+        isempty(js) && return b
+        bi = zero(promote_type(eltype(b), eltype(Hl)))
+        @batch per=core minbatch=64 reduction=(+,bi) for j in js
+          @inbounds bi += Hl[i, j] * b[j]
+        end
+        b[i] -= bi
+      end)
     end
     b[i] /= α[i]
   end
   return b
 end
-
-function _solve_householder2_inner!(b, H, i)
-  return _solve_householder2_inner!(b, H, i, LocalBlock(H))
-end
-function _solve_householder2_inner!(b, H, i, Hl::LocalColumnBlock)
+function _solve_householder2_rows!(b::SharedArray, H, α)
   m, n = size(H)
-  js = intersect(i+1:n, Hl.colrange)
-  isempty(js) && return b
-  bi = zero(promote_type(eltype(b), eltype(Hl)))
-  @batch per=core minbatch=64 reduction=(+,bi) for j in js
-    @inbounds bi += Hl[i, j] * b[j]
+  ps = procs(H)
+  ps = length(ps) == 1 ? ps : reverse(ps)
+  for p in ps
+    wait(@spawnat p begin
+      Hl = LocalRowBlock(H)
+      @inbounds @views for i in intersect(n:-1:1, Hl.rowrange)
+        bi = zero(promote_type(eltype(b), eltype(Hl)))
+        @batch per=core minbatch=64 reduction=(+,bi) for j in i+1:n
+          @inbounds bi += Hl[i, j] * b[j]
+        end
+        b[i] -= bi
+        return b
+      end
+      b[i] /= α[i]
+    end)
   end
-  b[i] -= bi
   return b
 end
+
 
 function solve_householder!(b, H, α)
   # H is the matrix A that has undergone householder!(A, α)
