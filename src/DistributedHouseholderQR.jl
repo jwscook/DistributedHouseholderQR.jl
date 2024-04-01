@@ -14,7 +14,6 @@ localindexes(A::AbstractArray) = Tuple(1:i for i in size(A))
 localindexes(A::DArray) = DistributedArrays.localindices(A)
 localindexes(A::SharedArray) = SharedArrays.localindices(A)
 
-
 rowcolumnblocks(A::AbstractArray, p, i) = (@assert p == 1; return 1:size(A, i))
 rowcolumnblocks(A::DArray, p, i) = A.indices[p - A.pids[1] + 1][i]
 rowblocks(A, p) = rowcolumnblocks(A, p, 1)
@@ -25,7 +24,7 @@ localblock(A::DArray) = localpart(A)
 localblock(A::SharedArray) = A
 localblock(A::AbstractArray) = A
 
-isdistributedbycolumns(A) = true#false
+isdistributedbycolumns(A) = true#false#
 function isdistributedbycolumns(A::DArray)
   for p in A.pids
     rowblocks(A, p) == 1:size(A, 1) || return false
@@ -79,8 +78,8 @@ function LocalRowBlock(A::AbstractVector)
   return LocalRowBlock(localblock(A), Δi, rowrange)
 end
 Base.setindex!(lrb::LocalRowBlock, v::Number, i, j) = (lrb.Al[i - lrb.Δi, j] = v)
-Base.setindex!(lrb::LocalRowBlock, v, j) = (lrb.Al[i - lrb.Δi] = v)
-Base.getindex(lrb::LocalRowBlock, i, j) = lrb.Al[i - lrb.Δi, j]
+#Base.setindex!(lrb::LocalRowBlock, v, j) = (lrb.Al[i - lrb.Δi] = v)
+Base.getindex(lrb::LocalRowBlock, i, j) = lrb.Al[i .- lrb.Δi, j]
 Base.getindex(lrb::LocalRowBlock, i) = lrb.Al[i - lrb.Δi, j]
 Base.eltype(lrb::LocalRowBlock) = eltype(lrb.Al)
 Base.view(lrb::LocalRowBlock, i, j) = view(lrb.Al, i - lrb.Δ, j)
@@ -90,6 +89,14 @@ function LocalBlock(A)
   rowrange == 1:size(A, 1) && return LocalColumnBlock(A)
   colrange == 1:size(A, 2) && return LocalRowBlock(A)
   throw(ArgumentError("Distribution of indices not implementd"))
+end
+
+@inline function normrowblock(H, is, j)
+  function inner(H, is, j)
+    Hl = LocalRowBlock(H);
+    sum(abs2, Hl[intersect(is, Hl.rowrange), j]);
+  end
+  return sqrt(sum(remotecall_fetch(inner, p, H, is, j) for p in procs(H)))
 end
 
 
@@ -110,7 +117,7 @@ function householder!(A, α)
   for p in procs(A)
     A, α = fetch(@spawnat p _householder!(A, α))
   end
-  (A, α)
+  return (A, α)
 end
 
 _householder!(H, α) = _householder!(H, α, LocalBlock(H))
@@ -119,6 +126,7 @@ function _householder!(H, α, Hl::LocalColumnBlock)
   m, n = size(H)
   Hj = zeros(eltype(H), m)
   t1a = t1b = 0.0
+  @show "Column"
   @inbounds @views for j in Hl.colrange
     t1a += @elapsed begin
     s = norm(Hl[j:m, j])
@@ -126,14 +134,18 @@ function _householder!(H, α, Hl::LocalColumnBlock)
     f = 1 / sqrt(s * (s + abs(Hl[j, j])))
     Hl[j, j] -= α[j]
     for i in j:m
+      @show i, j, s, f
       Hl[i, j] *= f
     end
+    @show j, H[:, j]
     end
+    @show H
     t1b += @elapsed begin
     @. Hj = Hl[:, j] # copying this will make all data in end loop local
+    @show j, Hj
     @sync for p in procs(H) # this is most expensive
       #j > columnblocks(H, p)[end] && continue
-      @spawnat p _householder_inner_localcolumnblock!(H, j, Hj)
+      wait(@spawnat p _householder_inner_localcolumnblock!(H, j, Hj))
     end
     end
   end
@@ -145,37 +157,43 @@ function _householder!(H, α, Hl::LocalRowBlock)
   m, n = size(H)
   Hj = zeros(eltype(H), m)
   t1a = t1b = 0.0
-  @inbounds @views for j in intersect(1:n, Hl.rowrange)
+  @show "Row"
+  @inbounds @views for j in intersect(1:n, Hl.rowrange)# get this right
     t1a += @elapsed begin
-    s = norm(Hl[j:m, j])
+    s = norm(H[j:m, j]) # dog slow?
+    #s = normrowblock(H, j:m, j)
     α[j] = s * alphafactor(Hl[j, j])
     f = 1 / sqrt(s * (s + abs(Hl[j, j])))
     Hl[j, j] -= α[j]
-    #for i in j:m
-    #  Hl[i, j] *= f
-    #end
-    @sync for p in procs(H) # this is most expensive
-      @spawnat p begin
+    @sync for p in procs(H)
+      wait(@spawnat p begin
         Hp = LocalRowBlock(H)
-        is = intersect(j:m, Hp.rowrange)
-        for i in is
-          Hl[i, j] *= f
+        @show p, j:m, Hp.rowrange
+        for i in intersect(j:m, Hp.rowrange)
+          @show i, j, s, f
+          Hp[i, j] *= f
         end
-      end
+      end)
     end
+    @show j, H[:, j]
     end
     t1b += @elapsed begin
-    @. Hj = H[:, j] # dog slow?
-    @sync for p in procs(H) # this is most expensive
-      @spawnat p begin
+    @. Hj[j:m] = H[j:m, j] # dog slow?
+    @show j, Hj
+    @sync for p in procs(H)
+      wait(@spawnat p begin
         Hp = LocalRowBlock(H)
         @batch per=core minbatch=64 for jj in j+1:n
+          #@show jj
           s = dot(view(Hj, j:m), view(H, j:m, jj)) # dog slow?
-          @inbounds for i in j:m
+          @show jj, Hj[j:m], H[j:m, jj]
+          @inbounds for i in intersect(j:m, Hp.rowrange)
+            #@show i
+          @show jj,i, s
             Hp[i, jj] -= Hj[i] * s
           end
         end
-      end
+      end)
     end
     end
   end
@@ -188,7 +206,9 @@ function _householder_inner_localcolumnblock!(H, j, Hj)
   Hl = LocalColumnBlock(H)
   @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
     s = dot(view(Hj, j:m), view(Hl, j:m, jj))
+    @show jj, Hj[j:m], H[j:m, jj]
     @inbounds for i in j:m
+          @show jj,i, s
       Hl[i, jj] -= Hj[i] * s
     end
   end
@@ -236,7 +256,7 @@ function _solve_householder1_inner!(b, H, α, Hl::LocalRowBlock)
     for p in procs(H)
       wait(@spawnat p begin
         Hl = LocalRowBlock(H)
-        for i in intersec(j:m, Hl.rowrange)
+        for i in intersect(j:m, Hl.rowrange)
           @inbounds b[i] -= Hl[i, j] * s
         end
       end)
@@ -248,11 +268,12 @@ end
 function _solve_householder2!(b::Vector, H, α::Vector)
   m, n = size(H)
   @inbounds @views for i in n:-1:1
-    bi = b[i]
-    @batch per=core minbatch=64 reduction=(-,bi) for j in i+1:n
-      bi -= H[i, j] * b[j]
+    bi = zero(promote_type(eltype(b), eltype(H)))
+    @batch per=core minbatch=64 reduction=(+,bi) for j in i+1:n
+      bi += H[i, j] * b[j]
     end
-    b[i] = bi / α[i]
+    b[i] -= bi
+    b[i] /= α[i]
   end
   return b
 end
@@ -301,9 +322,9 @@ function _solve_householder2_rows!(b::SharedArray, H, α)
           @inbounds bi += Hl[i, j] * b[j]
         end
         b[i] -= bi
+        b[i] /= α[i]
         return b
       end
-      b[i] /= α[i]
     end)
   end
   return b

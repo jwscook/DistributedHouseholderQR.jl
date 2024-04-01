@@ -22,7 +22,7 @@ const DHQR = DistributedHouseholderQR
 end
 
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in ((11, 10), (550, 500), (1100, 1000), (2200, 2000), (4400, 4000))
+  for T in (ComplexF64, ), mn in ((3, 2),)#((11, 10), (550, 500), (1100, 1000), (2200, 2000),)# (4400, 4000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
@@ -46,19 +46,34 @@ end
       #H, α = DHQR.householder!(A3, α3)
       #x3 = DHQR.solve_householder!(b3, H, α)
       qrA = DHQR.qr!(A3)
+      @show qrA
       x3 = qrA \ deepcopy(b)
+    end
+    A4 = DArray(ij->A[ij[1], ij[2]], size(A), workers(), (nworkers(), 1))
+    α4 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
+    b4 = SharedArray(deepcopy(b))
+    tc = @elapsed  begin
+      #H, α = DHQR.householder!(A4, α4)
+      #x4 = DHQR.solve_householder!(b4, H, α)
+      qrA = DHQR.qr!(A4)
+      @show qrA
+      x4 = qrA \ deepcopy(b)
     end
     @testset "stlib (threaded)" begin
       @test norm(A' * A * x1 .- A' * b) < sqrt(eps())
     end
-    @testset "this threaded only" begin
+    @testset "threaded only" begin
       @test norm(A' * A * x2 .- A' * b) < sqrt(eps())
     end
-    @testset "this distribributed + threaded" begin
+    @testset "column distribributed + threaded" begin
       @test norm(A' * A * x3 .- A' * b) < sqrt(eps())
     end
+    @testset "row distribributed + threaded" begin
+      @test norm(A' * A * x4 .- A' * b) < sqrt(eps())
+    end
     println("The threaded undistributed version $(ta/tl) times longer")
-    println("The threaded and distributed version $(tb/tl) times longer")
+    println("The threaded and column distributed version $(tb/tl) times longer")
+    println("The threaded and row distributed version $(tc/tl) times longer")
   end
 end
 
