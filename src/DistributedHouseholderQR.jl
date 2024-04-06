@@ -1,6 +1,6 @@
 module DistributedHouseholderQR
 
-using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester
+using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester, SIMD
 
 LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
 
@@ -33,15 +33,8 @@ function LocalColumnBlock(A::AbstractMatrix)
   Δj = colrange[1] - 1
   return LocalColumnBlock(localblock(A), Δj, colrange)
 end
-function LocalColumnBlock(A::AbstractVector)
-  colrange = localindexes(H)[1]
-  Δj = colrange[1] - 1
-  return LocalColumnBlock(localblock(A), Δj, colrange)
-end
 Base.setindex!(lcb::LocalColumnBlock, v::Number, i, j) = (lcb.Al[i, j - lcb.Δj] = v)
-Base.setindex!(lcb::LocalColumnBlock, v, j) = (lcb.Al[j - lcb.Δj] = v)
 Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
-Base.getindex(lcb::LocalColumnBlock, j) = lcb.Al[j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
 
@@ -58,17 +51,28 @@ Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
   return s
 end
 
-function householder!(A, α)
+
+householder!(A, α) = _householder!(A, α)
+
+function householder!(A::DArray, α)
   for p in procs(A)
+    try
     A, α = fetch(@spawnat p _householder!(A, α))
+    catch err
+      @show err
+      throw(err)
+    end
+
   end
   (A, α)
 end
 
+columnbuffer(H) = Vector(zeros(eltype(H), size(H, 1)))
+
 function _householder!(H, α)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  Hj = zeros(eltype(H), m)
+  Hj = columnbuffer(H)
   t1a = t1b = 0.0
   @inbounds @views for j in Hl.colrange
     t1a += @elapsed begin
@@ -92,14 +96,63 @@ function _householder!(H, α)
   return (H, α)
 end
 
-function _householder_inner!(H, j, Hj)
+@inline function hotloop!(Hl, Hj::Vector, s, is, jj)
+  @inbounds @views for i in is
+    Hl[i, jj] -= Hj[i] * s
+  end
+end
+@inline function hotloop!(Hl, Hj::Vector, s, is, jj, ::Type{<:Real})
+  # hand rolled simd loop as a practice for the complex version
+  slimit = (length(is) ÷ 4) * 4
+  vlimit = Vec(ntuple(i -> maximum(is) - i + 1, 4))
+  Hljj = view(Hl, :, jj)
+  lane = VecRange{4}(0)
+  @inbounds for i in minimum(is):4:maximum(is)
+    if i <= slimit
+      Hljj[i + lane] -= Hj[i + lane] * s
+    else
+      mask = Vec{4, Int}(i) <= vlimit
+      Hljj[i + lane, mask] -= Hj[i + lane, mask] * s
+    end
+  end
+end
+
+@inline function hotloop!(Hl, Hj::Vector{T}, s, is, jj,
+                          ::Type{T}) where {T<:Complex}
+  sr, si = reim(s)
+  riHl = reinterpret(real(eltype(Hl.Al)), view(Hl.Al, :, jj - Hl.Δj))
+  riHj = reinterpret(real(eltype(Hj)), Hj)
+
+  slimit = (length(is) ÷ 4) * 4
+  vlimit = Vec(ntuple(i -> 2maximum(is) - i + 2, 4))
+  lane = VecRange{4}(0)
+  shuffle1 = Val{(0, 0, 2, 2)}()
+  shuffle2 = Val{(1, 1, 3, 3)}()
+  s1 = Vec((sr, si, sr, si))
+  s2 = Vec((-si, sr, -si, sr))
+  @inbounds for ii in minimum(is):2:maximum(is)
+    i = 2ii # i = 2, 4, 8, ...: i-1 for real, i for imag
+    if i <= slimit
+      riHl[i-1 + lane] -= s1 * shufflevector(riHj[i-1 + lane], shuffle1) +
+                          s2 * shufflevector(riHj[i-1 + lane], shuffle2)
+
+    else
+      mask = Vec{4, Int}(i) <= vlimit
+      riHl[i-1 + lane, mask] -= s1 * shufflevector(riHj[i-1 + lane, mask], shuffle1) +
+                                s2 * shufflevector(riHj[i-1 + lane, mask], shuffle2)
+    end
+  end
+end
+
+function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
   @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
     s = dot(view(Hj, j:m), view(Hl, j:m, jj))
-    @inbounds for i in j:m
-      Hl[i, jj] -= Hj[i] * s
-    end
+    hotloop!(Hl, Vector(Hj), s, j:m, jj, eltype(H))
+    #@inbounds @views for i in j:m
+    #  Hl[i, jj] -= Hj[i] * s
+    #end
   end
   return Hl
 end
