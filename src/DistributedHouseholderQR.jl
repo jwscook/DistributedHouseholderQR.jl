@@ -56,13 +56,7 @@ householder!(A, α) = _householder!(A, α)
 
 function householder!(A::DArray, α)
   for p in procs(A)
-    try
     A, α = fetch(@spawnat p _householder!(A, α))
-    catch err
-      @show err
-      throw(err)
-    end
-
   end
   (A, α)
 end
@@ -74,25 +68,27 @@ function _householder!(H, α)
   Hl = LocalColumnBlock(H)
   Hj = columnbuffer(H)
   t1a = t1b = 0.0
-  @inbounds @views for j in Hl.colrange
+  @inbounds for j in Hl.colrange
     t1a += @elapsed begin
-    s = norm(Hl[j:m, j])
+    s = norm(view(Hl, j:m, j))
     α[j] = s * alphafactor(Hl[j, j])
     f = 1 / sqrt(s * (s + abs(Hl[j, j])))
     Hl[j, j] -= α[j]
-    for i in j:m
+    @batch per=core minbatch=64 for i in j:m
       Hl[i, j] *= f
     end
     end
     t1b += @elapsed begin
-    @. Hj = Hl[:, j] # copying this will make all data in end loop local
+    @batch per=core minbatch=64 for i in eachindex(Hj)
+      Hj[i] = Hl[i, j] # copying this will make all data in end loop local
+    end
     @sync for p in procs(H) # this is most expensive
       #j > columnblocks(H, p)[end] && continue
       @spawnat p _householder_inner!(H, j, Hj)
     end
     end
   end
-  #@show t1a, t1b
+  @show t1a, t1b
   return (H, α)
 end
 
@@ -123,33 +119,37 @@ end
   riHl = reinterpret(real(eltype(Hl.Al)), view(Hl.Al, :, jj - Hl.Δj))
   riHj = reinterpret(real(eltype(Hj)), Hj)
 
-  slimit = (length(is) ÷ 4) * 4
-  vlimit = Vec(ntuple(i -> 2maximum(is) - i + 2, 4))
+  slimit = (length(is) ÷ 4) * 4 # 4 Float64s per register
+  vlimit = Vec(ntuple(i -> 2 * (maximum(is) + 1) - i, 4))
   lane = VecRange{4}(0)
-  shuffle1 = Val{(0, 0, 2, 2)}()
+  shuffle1 = Val{(0, 0, 2, 2)}() # 4 long
   shuffle2 = Val{(1, 1, 3, 3)}()
   s1 = Vec((sr, si, sr, si))
   s2 = Vec((-si, sr, -si, sr))
   @inbounds for ii in minimum(is):2:maximum(is)
     i = 2ii # i = 2, 4, 8, ...: i-1 for real, i for imag
     if i <= slimit
-      riHl[i-1 + lane] -= s1 * shufflevector(riHj[i-1 + lane], shuffle1) +
-                          s2 * shufflevector(riHj[i-1 + lane], shuffle2)
+      riHjlane = riHj[i-1 + lane]
+      riHl[i-1 + lane] -= s1 * shufflevector(riHjlane, shuffle1) +
+                          s2 * shufflevector(riHjlane, shuffle2)
 
     else
       mask = Vec{4, Int}(i) <= vlimit
-      riHl[i-1 + lane, mask] -= s1 * shufflevector(riHj[i-1 + lane, mask], shuffle1) +
-                                s2 * shufflevector(riHj[i-1 + lane, mask], shuffle2)
+      riHjlane = riHj[i-1 + lane, mask]
+      riHl[i-1 + lane, mask] -= s1 * shufflevector(riHjlane, shuffle1) +
+                                s2 * shufflevector(riHjlane, shuffle2)
     end
   end
 end
-
+using FLoops
 function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  @batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
+  # @batch makes Hj a StridedVector rather than a Vector, and then SIMD can't cope
+  #@batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
+  for jj in intersect(j+1:n, Hl.colrange)
     s = dot(view(Hj, j:m), view(Hl, j:m, jj))
-    hotloop!(Hl, Vector(Hj), s, j:m, jj, eltype(H))
+    hotloop!(Hl, Hj, s, j:m, jj, eltype(H))
     #@inbounds @views for i in j:m
     #  Hl[i, jj] -= Hj[i] * s
     #end
@@ -234,7 +234,7 @@ function solve_householder!(b, H, α)
   # now that b holds the value of Q'b
   # we may back sub with R
   t2 = @elapsed _solve_householder2!(b, H, α)
-  #@show t2
+  @show t2
   return b[1:n]
 end
 
