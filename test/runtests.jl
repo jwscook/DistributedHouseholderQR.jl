@@ -25,7 +25,7 @@ splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
 lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
 hirange(np, N, p) = min(N, splits(np, N, p))
 end
-
+using StatProfilerHTML
 @testset "Distributed Householder QR" begin
   for T in (ComplexF64, ), mn in ((11, 10), (550, 500), (1100, 1000), (2200, 2000), (4400, 4000),)# (8800, 8000))
     m, n = mn
@@ -42,6 +42,7 @@ end
     _A2 = deepcopy(Matrix(A))
     _b2 = deepcopy(Vector(b))
     x2 = DHQR.qr!(A2) \ b2
+    @profilehtml DHQR.qr!(A2) \ b2
     bm2 = @benchmark DHQR.qr!($(deepcopy(_A2))) \ $(_b2)
     ta = minimum(bm2).time / 1e9
     # distribute A across columns
