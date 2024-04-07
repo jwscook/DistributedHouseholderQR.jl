@@ -1,6 +1,7 @@
 module DistributedHouseholderQR
 
-using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester, SIMD
+using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester
+using SIMD, Base.Threads
 
 LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
 
@@ -97,62 +98,53 @@ end
     Hl[i, jj] -= Hj[i] * s
   end
 end
+
 @inline function hotloop!(Hl, Hj::Vector, s, is, jj, ::Type{<:Real})
-  # hand rolled simd loop as a practice for the complex version
-  slimit = (length(is) ÷ 4) * 4
-  vlimit = Vec(ntuple(i -> maximum(is) - i + 1, 4))
-  Hljj = view(Hl, :, jj)
-  lane = VecRange{4}(0)
-  @inbounds for i in minimum(is):4:maximum(is)
-    if i <= slimit
-      Hljj[i + lane] -= Hj[i + lane] * s
-    else
-      mask = Vec{4, Int}(i) <= vlimit
-      Hljj[i + lane, mask] -= Hj[i + lane, mask] * s
-    end
+  @inbounds @simd for i in is
+    Hl[i, jj] -= Hj[i] * s
   end
 end
 
 @inline function hotloop!(Hl, Hj::Vector{T}, s, is, jj,
                           ::Type{T}) where {T<:Complex}
   sr, si = reim(s)
-  riHl = reinterpret(real(eltype(Hl.Al)), view(Hl.Al, :, jj - Hl.Δj))
+  riHl = reinterpret(real(eltype(Hl)), view(Hl.Al, :, jj - Hl.Δj))
   riHj = reinterpret(real(eltype(Hj)), Hj)
 
   slimit = (length(is) ÷ 4) * 4 # 4 Float64s per register
-  vlimit = Vec(ntuple(i -> 2 * (maximum(is) + 1) - i, 4))
   lane = VecRange{4}(0)
   shuffle1 = Val{(0, 0, 2, 2)}() # 4 long
   shuffle2 = Val{(1, 1, 3, 3)}()
-  s1 = Vec((sr, si, sr, si))
-  s2 = Vec((-si, sr, -si, sr))
-  @inbounds for ii in minimum(is):2:maximum(is)
+  s1 = Vec((-sr, -si, -sr, -si))
+  s2 = Vec((si, -sr, si, -sr))
+  @inbounds for ii in minimum(is):2:minimum(is) + slimit - 1
     i = 2ii # i = 2, 4, 8, ...: i-1 for real, i for imag
-    if i <= slimit
-      riHjlane = riHj[i-1 + lane]
-      riHl[i-1 + lane] -= s1 * shufflevector(riHjlane, shuffle1) +
-                          s2 * shufflevector(riHjlane, shuffle2)
-
-    else
-      mask = Vec{4, Int}(i) <= vlimit
-      riHjlane = riHj[i-1 + lane, mask]
-      riHl[i-1 + lane, mask] -= s1 * shufflevector(riHjlane, shuffle1) +
-                                s2 * shufflevector(riHjlane, shuffle2)
-    end
+    riHjlane = riHj[i-1 + lane]
+    riHllane = riHl[i-1 + lane]
+    riHllane = muladd(s1, shufflevector(riHjlane, shuffle1), riHllane)
+    riHllane = muladd(s2, shufflevector(riHjlane, shuffle2), riHllane)
+    riHl[i-1 + lane] = riHllane
+  end
+  @inbounds for ii in minimum(is) + slimit:maximum(is)
+    Hl[ii, jj] -= s * Hj[ii]
   end
 end
-using FLoops
+
 function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  # @batch makes Hj a StridedVector rather than a Vector, and then SIMD can't cope
-  #@batch per=core minbatch=64 for jj in intersect(j+1:n, Hl.colrange)
-  for jj in intersect(j+1:n, Hl.colrange)
-    s = dot(view(Hj, j:m), view(Hl, j:m, jj))
-    hotloop!(Hl, Hj, s, j:m, jj, eltype(H))
-    #@inbounds @views for i in j:m
-    #  Hl[i, jj] -= Hj[i] * s
-    #end
+  # @batch makes Hj a StridedVector rather than a Vector, and then SIMD can't cope:
+  #@batch per=core minbatch=4 for jj in intersect(j+1:n, Hl.colrange)
+  # FLoops can be used the simd version of the hotloop:
+  #@floop ThreadedEx() for jj in intersect(j+1:n, Hl.colrange)
+  jjs = intersect(j+1:n, Hl.colrange)
+  isempty(jjs) && return Hl
+  jjsblocks = [minimum(jjs) + i - 1:nthreads():maximum(jjs) for i in 1:nthreads()]
+  @threads for jjt in jjsblocks
+    for jj in jjt
+      s = dot(view(Hj, j:m), view(Hl, j:m, jj))
+      hotloop!(Hl, Hj, s, j:m, jj, eltype(H))
+    end
   end
   return Hl
 end
@@ -204,11 +196,13 @@ function _solve_householder2!(b::SharedArray, H, α)
   ps = procs(H)
   ps = length(ps) == 1 ? ps : reverse(ps)
   @inbounds @views for i in n:-1:1
+    futures = Vector{Future}()
     for p in ps
       i > columnblocks(H, p)[end] && continue
-      wait(@spawnat p _solve_householder2_inner!(b, H, i))
+      push!(futures, @spawnat p _solve_householder2_inner!(b, H, i))
     end
-    b[i] /= α[i]
+    bi = sum(fetch.(futures))
+    b[i] = (b[i] - bi) / α[i]
   end
   return b
 end
@@ -217,13 +211,12 @@ function _solve_householder2_inner!(b, H, i)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
   js = intersect(i+1:n, Hl.colrange)
-  isempty(js) && return b
   bi = zero(promote_type(eltype(b), eltype(Hl)))
-  @batch per=core minbatch=64 reduction=(+,bi) for j in js
+  isempty(js) && return bi
+  for j in js
     @inbounds bi += Hl[i, j] * b[j]
   end
-  b[i] -= bi
-  return b
+  return bi
 end
 
 function solve_householder!(b, H, α)
