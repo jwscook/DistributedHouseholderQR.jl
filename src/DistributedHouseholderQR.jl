@@ -62,12 +62,10 @@ function householder!(A::DArray, α)
   (A, α)
 end
 
-columnbuffer(H) = Vector(zeros(eltype(H), size(H, 1)))
-
 function _householder!(H, α)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  Hj = columnbuffer(H)
+  Hj = Vector(zeros(eltype(H), size(H, 1)))
   t1a = t1b = 0.0
   @inbounds for j in Hl.colrange
     t1a += @elapsed begin
