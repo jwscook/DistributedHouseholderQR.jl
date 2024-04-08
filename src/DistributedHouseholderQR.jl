@@ -1,7 +1,7 @@
 module DistributedHouseholderQR
 
 using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester
-using SIMD, Base.Threads
+using SIMD, Base.Threads, ThreadPinning
 
 LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
 
@@ -142,7 +142,7 @@ function loadbalancethreads(jjs)
     z -= 1
     t = mod1(t + 1, Threads.nthreads())
   end
-  return blocks
+  return filter(!isempty, sort!.(blocks))
 end
 
 function _householder_inner!(H, j, Hj::Vector)

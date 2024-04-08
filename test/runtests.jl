@@ -7,6 +7,7 @@ Random.seed!(0)
 
 using DistributedHouseholderQR
 addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
+@show nthreads()
 @everywhere using Test
 @everywhere begin
   using LinearAlgebra, Random, Test
@@ -16,12 +17,14 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
   ThreadPinning.Prefs.set_os_warning(false)
   @static if Sys.islinux()
     nt = Threads.nthreads()
-    if myid() != 2
-      ThreadPinning.cpuids_per_numa()[2][1:nt]
+    p = max(1, myid()-1)
+    cpus = if p > nworkers() / 2
+      ThreadPinning.cpuids_per_numa()[2][(p-1)*nt+1-10:p*nt-10]
     else
-      ThreadPinning.cpuids_per_numa()[1][1:nt]
+      ThreadPinning.cpuids_per_numa()[1][(p-1)*nt+1:p*nt]
     end
-    ThreadPinning.pinthreads(:firstn)
+    ThreadPinning.pinthreads(cpus; force=true)
+    wait(@spawnat 1 ThreadPinning.pinthreads(1:nt; force=true))
     println("\tCPUs: ", getcpuids())
   end
   LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
@@ -30,12 +33,13 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
   const DHQR = DistributedHouseholderQR
 
   splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
+  splits(np, N, p) = round(Int, N * (1 -sqrt((np-p) / np)))
   lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
   hirange(np, N, p) = min(N, splits(np, N, p))
 end
 using StatProfilerHTML
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in (#=(11, 10), (550, 500), (1100, 1000),=# (2200, 2000), (4400, 4000),) #(8800, 8000))
+    for T in (ComplexF64, ), mn in (#=(11, 10), (88, 80),)=# (550, 500), (1100, 1000), (2200, 2000), (4400, 4000),) #(8800, 8000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
@@ -64,9 +68,9 @@ using StatProfilerHTML
     bm2 = @benchmark DHQR.qr!($(deepcopy(_A2))) \ $(_b2)
     ta = minimum(bm2).time / 1e9
     # distribute A across columns
-    A3 = DArray(ij->A[ij[1], ij[2]], size(A), workers(), (1, nworkers()))
     #ras = [@spawnat workers()[i] A[:, lorange(np, n, i):hirange(np, n, i)] for i in 1:np]
     #A3 = DArray(reshape(ras, (1, nworkers())))
+    A3 = DArray(ij->A[ij[1], ij[2]], size(A), workers(), (1, nworkers()))
 
     α3 = SharedArray(zeros(T,n))#zeros(T,n)#distribute(zeros(T, n))#
     b3 = SharedArray(deepcopy(b))
