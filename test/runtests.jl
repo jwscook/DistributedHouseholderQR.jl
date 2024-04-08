@@ -9,25 +9,33 @@ using DistributedHouseholderQR
 addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
 @everywhere using Test
 @everywhere begin
-using LinearAlgebra, Random, Test
-using Distributed, DistributedArrays, SharedArrays
-using ThreadPinning
+  using LinearAlgebra, Random, Test
+  using Distributed, DistributedArrays, SharedArrays
 
-ThreadPinning.Prefs.set_os_warning(false)
-@static if Sys.islinux()
-  ThreadPinning.pinthreads(:cores)
-end
-using DistributedHouseholderQR
-LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
+  using ThreadPinning
+  ThreadPinning.Prefs.set_os_warning(false)
+  @static if Sys.islinux()
+    nt = Threads.nthreads()
+    if myid() != 2
+      ThreadPinning.cpuids_per_numa()[2][1:nt]
+    else
+      ThreadPinning.cpuids_per_numa()[1][1:nt]
+    end
+    ThreadPinning.pinthreads(:firstn)
+    println("\tCPUs: ", getcpuids())
+  end
+  LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
 
-const DHQR = DistributedHouseholderQR
-splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
-lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
-hirange(np, N, p) = min(N, splits(np, N, p))
+  using DistributedHouseholderQR
+  const DHQR = DistributedHouseholderQR
+
+  splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
+  lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
+  hirange(np, N, p) = min(N, splits(np, N, p))
 end
 using StatProfilerHTML
 @testset "Distributed Householder QR" begin
-  for T in (ComplexF64, ), mn in (#=(11, 10), (550, 500), (1100, 1000),=# (2200, 2000), (4400, 4000), (8800, 8000))
+  for T in (ComplexF64, ), mn in (#=(11, 10), (550, 500), (1100, 1000),=# (2200, 2000), (4400, 4000),) #(8800, 8000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)

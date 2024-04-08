@@ -3,7 +3,7 @@ module DistributedHouseholderQR
 using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester
 using SIMD, Base.Threads
 
-LinearAlgebra.BLAS.set_num_threads(Base.Threads.nthreads())
+LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
 
 alphafactor(x::Real) = -sign(x)
 alphafactor(x::Complex) = -exp(im * angle(x))
@@ -128,6 +128,23 @@ end
   end
 end
 
+function loadbalancethreads(jjs)
+  blocks = [Int32[] for _ in 1:Threads.nthreads()]
+  t = 1
+  a, z = extrema(jjs)
+  while a <= z
+    if a != z
+      push!(blocks[t], a, z)
+    else
+      push!(blocks[t], a)
+    end
+    a += 1
+    z -= 1
+    t = mod1(t + 1, Threads.nthreads())
+  end
+  return blocks
+end
+
 function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
@@ -138,6 +155,7 @@ function _householder_inner!(H, j, Hj::Vector)
   jjs = intersect(j+1:n, Hl.colrange)
   isempty(jjs) && return Hl
   jjsblocks = [minimum(jjs) + i - 1:nthreads():maximum(jjs) for i in 1:nthreads()]
+  #jjsblocks = loadbalancethreads(jjs)
   @threads for jjt in jjsblocks
     for jj in jjt
       s = dot(view(Hj, j:m), view(Hl, j:m, jj))
