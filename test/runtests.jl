@@ -37,9 +37,9 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
   lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
   hirange(np, N, p) = min(N, splits(np, N, p))
 end
-using StatProfilerHTML
+using StatProfilerHTML, Profile
 @testset "Distributed Householder QR" begin
-    for T in (ComplexF64, ), mn in (#=(11, 10), (88, 80),)=# (550, 500), (1100, 1000), (2200, 2000), (4400, 4000),) #(8800, 8000))
+  for T in (Float32, ComplexF32, Float64, ComplexF64, ), mn in (#=(11, 10), (88, 80),(550, 500),)=#  (1100, 1000), (2200, 2000),)# (4400, 4000),) #(8800, 8000))
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
@@ -47,23 +47,20 @@ using StatProfilerHTML
     b1 = deepcopy(Vector(b))
     x1 = LinearAlgebra.qr!(A1, NoPivot()) \ b1
 
-    @testset "stlib (threaded)" begin
-      @test norm(A' * A * x1 .- A' * b) < sqrt(eps())
-    end
+    stdliberr = norm(A' * A * x1 .- A' * b)
 
-    bm1 =@benchmark LinearAlgebra.qr!($(deepcopy(A))) \ $(deepcopy(b))
+    bm1 = @benchmark LinearAlgebra.qr!($(deepcopy(A))) \ $(deepcopy(b))
     tl = minimum(bm1).time / 1e9
-    println("The stdlib took $tl seconds for m=$m and n=$n")
     A2 = deepcopy(Matrix(A))
     b2 = deepcopy(Vector(b))
     _A2 = deepcopy(Matrix(A))
     _b2 = deepcopy(Vector(b))
     x2 = DHQR.qr!(A2) \ b2
 
-    @testset "this threaded only" begin
-      @test norm(A' * A * x2 .- A' * b) < sqrt(eps())
+    @testset "$T threaded only" begin
+      @test norm(A' * A * x2 .- A' * b) < 8stdliberr
     end
-
+    Profile.clear()
     @profilehtml DHQR.qr!(A2) \ b2
     bm2 = @benchmark DHQR.qr!($(deepcopy(_A2))) \ $(_b2)
     ta = minimum(bm2).time / 1e9
@@ -79,15 +76,16 @@ using StatProfilerHTML
     qrA = DHQR.qr!(A3)
     x3 = qrA \ deepcopy(b)
 
-    @testset "this distribributed + threaded" begin
-      @test norm(A' * A * x3 .- A' * b) < sqrt(eps())
+    @testset "$T distribributed + threaded" begin
+      @test norm(A' * A * x3 .- A' * b) < 8stdliberr
     end
 
     bm3 = @benchmark DHQR.qr!($(_A3)) \ $(_b3)
     tb = minimum(bm3.times) / 1e9
 
-    println("The threaded undistributed version $(ta/tl) times longer")
-    println("The threaded and distributed version $(tb/tl) times longer")
+    println("m=$m, n=$n, T=$T: stdlib took $tl seconds")
+    println("m=$m, n=$n, T=$T: threaded undistributed took $(ta/tl) times longer")
+    println("m=$m, n=$n, T=$T: threaded & distributed took $(tb/tl) times longer")
   end
 end
 

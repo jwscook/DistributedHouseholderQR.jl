@@ -1,7 +1,7 @@
 module DistributedHouseholderQR
 
 using Distributed, LinearAlgebra, DistributedArrays, SharedArrays, Polyester
-using SIMD, Base.Threads, ThreadPinning
+using SIMD, Base.Threads
 
 LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
 
@@ -39,15 +39,10 @@ Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
 
-@inline function partialdot(v, A, is, j)
-  s = if length(is) < 64
-    dot(v[is], A[is, j])
-  else
-    s = zero(eltype(A))
-    @inbounds @batch minbatch=64 reduction=(+,s) for i in is
-      s += conj(v[i]) * A[i, j]
-    end
-    s
+@inline function partialdot(v, A, is) # this will be called in a thread
+  s = zero(eltype(A))
+  @inbounds for i in is
+    s += conj(v[i]) * A[i]
   end
   return s
 end
@@ -82,41 +77,56 @@ function _householder!(H, α)
       Hj[i] = Hl[i, j] # copying this will make all data in end loop local
     end
     @sync for p in procs(H) # this is most expensive
-      #j > columnblocks(H, p)[end] && continue
       @spawnat p _householder_inner!(H, j, Hj)
     end
     end
   end
-  @show t1a, t1b
+  #@show t1a, t1b
   return (H, α)
 end
 
-@inline function hotloop!(Hl, Hj::Vector, s, is, jj)
+@inline function hotloop!(Hl, Hj, s, is, jj)
   @inbounds @views for i in is
     Hl[i, jj] -= Hj[i] * s
   end
 end
 
-@inline function hotloop!(Hl, Hj::Vector, s, is, jj, ::Type{<:Real})
+@inline function hotloop!(Hl, Hj, s, is, jj, ::Type{<:Real})
   @inbounds @simd for i in is
     Hl[i, jj] -= Hj[i] * s
   end
 end
 
-@inline function hotloop!(Hl, Hj::Vector{T}, s, is, jj,
-                          ::Type{T}) where {T<:Complex}
-  sr, si = reim(s)
-  riHl = reinterpret(real(eltype(Hl)), view(Hl.Al, :, jj - Hl.Δj))
-  riHj = reinterpret(real(eltype(Hj)), Hj)
+using StrideArraysCore
+Base.@propagate_inbounds SIMD._pointer(arr::StrideArraysCore.PtrArray, i, I) =
+    pointer(Base.unsafe_view(arr, 1, I...), i)
 
-  slimit = (length(is) ÷ 4) * 4 # 4 Float64s per register
-  lane = VecRange{4}(0)
+
+function shuffleandsvectors(s, ::Val{4})
+  sr, si = reim(s)
   shuffle1 = Val{(0, 0, 2, 2)}() # 4 long
   shuffle2 = Val{(1, 1, 3, 3)}()
   s1 = Vec((-sr, -si, -sr, -si))
   s2 = Vec((si, -sr, si, -sr))
-  @inbounds for ii in minimum(is):2:minimum(is) + slimit - 1
-    i = 2ii # i = 2, 4, 8, ...: i-1 for real, i for imag
+  return (shuffle1, shuffle2, s1, s2)
+end
+
+@inline function hotloop!(Hl, Hj, s, is, jj, ::Type{<:Complex})
+  return hotloop!(Hl, Hj, s, is, jj)
+end
+@inline function hotloop!(Hl, Hj, s, is, jj, ::Type{ComplexF64})
+  return hotloop!(Hl, Hj, s, is, jj, ComplexF64, Val(4))
+end
+@inline function hotloop!(Hl, Hj, s, is, jj, ::Type{T}, ::Val{N}
+    ) where {T<:Complex, N}
+  riHl = reinterpret(real(eltype(Hl)), view(Hl.Al, :, jj - Hl.Δj))
+  riHj = reinterpret(real(eltype(Hj)), Hj)
+
+  slimit = (length(is) ÷ N) * N # 4 Float64s per register
+  lane = VecRange{N}(0)
+  (shuffle1, shuffle2, s1, s2) = shuffleandsvectors(s, Val(N))
+  @inbounds for ii in minimum(is):N÷2:minimum(is) + slimit - 1
+    i = N÷2*ii # i = 2, 4, 8, ...: i-1 for real, i for imag
     riHjlane = riHj[i-1 + lane]
     riHllane = riHl[i-1 + lane]
     riHllane = muladd(s1, shufflevector(riHjlane, shuffle1), riHllane)
@@ -156,9 +166,10 @@ function _householder_inner!(H, j, Hj::Vector)
   isempty(jjs) && return Hl
   jjsblocks = [minimum(jjs) + i - 1:nthreads():maximum(jjs) for i in 1:nthreads()]
   #jjsblocks = loadbalancethreads(jjs)
-  @threads for jjt in jjsblocks
+  #@threads for jjt in jjsblocks
+  @batch per=core minbatch=1 for jjt in jjsblocks
     for jj in jjt
-      s = dot(view(Hj, j:m), view(Hl, j:m, jj))
+      s = partialdot(Hj, view(Hl, :, jj), j:m)
       hotloop!(Hl, Hj, s, j:m, jj, eltype(H))
     end
   end
@@ -168,7 +179,7 @@ end
 function _solve_householder1!(b::Vector, H, α::Vector)
   m, n = size(H)
   for j in 1:n
-    s = dot(H[j:m, j], b[j:m])
+    s = partialdot(view(H, :, j), b, j:m)
     @batch for i in j:m
       @inbounds b[i] -= H[i, j] * s
     end
@@ -187,8 +198,7 @@ function _solve_householder1_inner!(b, H, α)
   # multuply by Q' ...
   Hl = LocalColumnBlock(H)
   @views for j in intersect(1:n, Hl.colrange)
-    s = dot(Hl[j:m, j], b[j:m])
-#    s = conj(partialdot(b, Hl, j:m, j))
+    s = partialdot(view(Hl, :, j), b, j:m)
     @batch per=core minbatch=64 for i in j:m
       @inbounds b[i] -= Hl[i, j] * s
     end
@@ -243,7 +253,7 @@ function solve_householder!(b, H, α)
   # now that b holds the value of Q'b
   # we may back sub with R
   t2 = @elapsed _solve_householder2!(b, H, α)
-  @show t2
+  #@show t2
   return b[1:n]
 end
 
