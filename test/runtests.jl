@@ -32,14 +32,15 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
   using DistributedHouseholderQR
   const DHQR = DistributedHouseholderQR
 
-  splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
+  #splits(np, N, p) = round(Int, (N / sqrt(np)) * sqrt(p))
   splits(np, N, p) = round(Int, N * (1 -sqrt((np-p) / np)))
   lorange(np, N, p) = max(1, splits(np, N, p-1) + 1)
   hirange(np, N, p) = min(N, splits(np, N, p))
 end
 using StatProfilerHTML, Profile
 @testset "Distributed Householder QR" begin
-  for T in (Float32, ComplexF32, Float64, ComplexF64, ), mn in (#=(11, 10), (88, 80),(550, 500),)=#  (1100, 1000), (2200, 2000),)# (4400, 4000),) #(8800, 8000))
+  for mn in ((1100, 1000), (2200, 2000), (4400, 4000),),
+      T in (Float32, ComplexF32, Float64, ComplexF64, )
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
