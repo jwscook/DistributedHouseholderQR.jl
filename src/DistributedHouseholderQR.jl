@@ -39,14 +39,76 @@ Base.getindex(lcb::LocalColumnBlock, i, j) = lcb.Al[i, j - lcb.Δj]
 Base.eltype(lcb::LocalColumnBlock) = eltype(lcb.Al)
 Base.view(lcb::LocalColumnBlock, i, j) = view(lcb.Al, i, j - lcb.Δj)
 
-@inline function partialdot(v, A, is) # this will be called in a thread
-  s = zero(eltype(A))
-  @inbounds for i in is
-    s += conj(v[i]) * A[i]
+@inline function partialdot(a, b, is, ::Type{<:Real})
+ # this will be called in a thread
+  s = zero(promote_type(eltype(b), eltype(b)))
+  @inbounds @simd for i in is
+    s += a[i] * b[i]
   end
   return s
 end
 
+@inline function partialdot(a, b, is, ::Type{<:Complex})
+  s = zero(promote_type(eltype(b), eltype(b)))
+  @inbounds for i in is
+    ar, ai = reim(a[i])
+    br, bi = reim(b[i])
+    s += Complex(ar * br + ai * bi, ar * bi - ai * br)
+  end
+  return s
+end
+
+
+using StrideArraysCore
+Base.@propagate_inbounds SIMD._pointer(arr::StrideArraysCore.PtrArray, i, I) =
+    pointer(Base.unsafe_view(arr, 1, I...), i)
+
+#  # This is dog slow unfortunately
+#@inline function partialdotsimdvectors(::Val{4}, ::Type{T}) where T
+#  shuffle1 = Val{(0, 0, 2, 2)}() # 4 long
+#  shuffle2 = Val{(1, 1, 3, 3)}()
+#  shuffle3 = Val{(1, 0, 3, 2)}()
+#  z = one(T)
+#  v = Vec((z, -z, z, -z))
+#  return (shuffle1, shuffle2, shuffle3, v)
+#end
+#@inline partialdot(a, b, is, ::Type{T}) where T  = partialdot(a, b, is)
+#@inline function partialdot(a, b, is, ::Type{ComplexF64})
+#  return partialdot(a, b, is, ComplexF64, Val(4))
+#end
+#@inline function sumcollapse(v::Vec{N, T}) where {N, T}
+#  rv = iv = zero(T)
+#  for i in 1:2:N
+#    rv += v[i]
+#    iv += v[i + 1]
+#  end
+#  return Complex(rv, iv)
+#end
+#@inline function partialdot(a, b, is, ::Type{ComplexF64}, ::Val{N}) where N
+#  ria = reinterpret(real(eltype(a)), view(a, is))
+#  rib = reinterpret(real(eltype(b)), view(b, is))
+#
+#  slimit = (length(is) ÷ N) * N # 4 Float64s per register
+#  lane = VecRange{N}(0)
+#  T = real(promote_type(eltype(a), eltype(b)))
+#  svec = Vec(Tuple(zero(T) for _ in 1:N))
+#  sh1, sh2, sh3, v = partialdotsimdvectors(Val(N), T)
+#  @inbounds for ii in 1:N÷2:slimit - 1
+#    i = (N÷2)*ii # i = 2, 4, 8, ...: i-1 for real, i for imag
+#    # conj(a) * b = (ar - im * ai) * (br + im * bi) =    (ar*br + ai*bi)
+#    #                                                 im*(ar*bi - ai*br)
+#    rialane = ria[i-1 + lane]
+#    riblane = rib[i-1 + lane]
+#    svec = muladd(shufflevector(rialane, sh1), riblane, svec)
+#    stmp = shufflevector(rialane, sh2) * shufflevector(riblane, sh3)
+#    svec = muladd(v, stmp, svec)
+#  end
+#  s = sumcollapse(svec)
+#  @inbounds for i in minimum(is) + slimit:maximum(is)
+#    s += conj(a[i]) * b[i]
+#  end
+#  return s
+#end
 
 householder!(A, α) = _householder!(A, α)
 
@@ -97,12 +159,7 @@ end
   end
 end
 
-using StrideArraysCore
-Base.@propagate_inbounds SIMD._pointer(arr::StrideArraysCore.PtrArray, i, I) =
-    pointer(Base.unsafe_view(arr, 1, I...), i)
-
-
-function shuffleandsvectors(s, ::Val{4})
+function hotloopsimdvectors(s, ::Val{4})
   sr, si = reim(s)
   shuffle1 = Val{(0, 0, 2, 2)}() # 4 long
   shuffle2 = Val{(1, 1, 3, 3)}()
@@ -119,12 +176,12 @@ end
 end
 @inline function hotloop!(Hl, Hj, s, is, jj, ::Type{T}, ::Val{N}
     ) where {T<:Complex, N}
-  riHl = reinterpret(real(eltype(Hl)), view(Hl.Al, :, jj - Hl.Δj))
+  riHl = reinterpret(real(eltype(Hl)), view(Hl, :, jj))
   riHj = reinterpret(real(eltype(Hj)), Hj)
 
-  slimit = (length(is) ÷ N) * N # 4 Float64s per register
+  slimit = (length(is) ÷ N) * N # 4 Float64s per register for 256 bit ymm
   lane = VecRange{N}(0)
-  (shuffle1, shuffle2, s1, s2) = shuffleandsvectors(s, Val(N))
+  (shuffle1, shuffle2, s1, s2) = hotloopsimdvectors(s, Val(N))
   @inbounds for ii in minimum(is):N÷2:minimum(is) + slimit - 1
     i = N÷2*ii # i = 2, 4, 8, ...: i-1 for real, i for imag
     riHjlane = riHj[i-1 + lane]
@@ -138,23 +195,6 @@ end
   end
 end
 
-function loadbalancethreads(jjs)
-  blocks = [Int32[] for _ in 1:Threads.nthreads()]
-  t = 1
-  a, z = extrema(jjs)
-  while a <= z
-    if a != z
-      push!(blocks[t], a, z)
-    else
-      push!(blocks[t], a)
-    end
-    a += 1
-    z -= 1
-    t = mod1(t + 1, Threads.nthreads())
-  end
-  return filter(!isempty, sort!.(blocks))
-end
-
 function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
@@ -164,12 +204,12 @@ function _householder_inner!(H, j, Hj::Vector)
   #@floop ThreadedEx() for jj in intersect(j+1:n, Hl.colrange)
   jjs = intersect(j+1:n, Hl.colrange)
   isempty(jjs) && return Hl
-  jjsblocks = [minimum(jjs) + i - 1:nthreads():maximum(jjs) for i in 1:nthreads()]
-  #jjsblocks = loadbalancethreads(jjs)
-  #@threads for jjt in jjsblocks
+  nchunk = ceil(Int, length(jjs) / nthreads())
+  @assert nchunk * nthreads() >= length(jjs)
+  jjsblocks = [jjs[(i-1)*nchunk+1:min(i*nchunk, length(jjs))] for i in 1:nthreads()]
   @batch per=core minbatch=1 for jjt in jjsblocks
     for jj in jjt
-      s = partialdot(Hj, view(Hl, :, jj), j:m)
+      s = partialdot(Hj, view(Hl, :, jj), j:m, eltype(Hj))
       hotloop!(Hl, Hj, s, j:m, jj, eltype(H))
     end
   end
@@ -179,7 +219,7 @@ end
 function _solve_householder1!(b::Vector, H, α::Vector)
   m, n = size(H)
   for j in 1:n
-    s = partialdot(view(H, :, j), b, j:m)
+    s = partialdot(view(H, :, j), b, j:m, eltype(H))
     @batch for i in j:m
       @inbounds b[i] -= H[i, j] * s
     end
@@ -198,7 +238,7 @@ function _solve_householder1_inner!(b, H, α)
   # multuply by Q' ...
   Hl = LocalColumnBlock(H)
   @views for j in intersect(1:n, Hl.colrange)
-    s = partialdot(view(Hl, :, j), b, j:m)
+    s = partialdot(view(Hl, :, j), b, j:m, eltype(H))
     @batch per=core minbatch=64 for i in j:m
       @inbounds b[i] -= Hl[i, j] * s
     end

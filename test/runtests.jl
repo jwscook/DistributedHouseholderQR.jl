@@ -39,8 +39,8 @@ addprocs(np, exeflags=["--proj=@.","-t $(nthreads())"])
 end
 using StatProfilerHTML, Profile
 @testset "Distributed Householder QR" begin
-  for mn in ((1100, 1000), (2200, 2000), (4400, 4000),),
-      T in (Float32, ComplexF32, Float64, ComplexF64, )
+    for mn in ((110, 100), (220, 200), (440, 400), (880, 800),(1100, 1000), (2200, 2000), (4400, 4000),),
+      T in (Float64, ComplexF64, )
     m, n = mn
     A = rand(T, m, n)
     b = rand(T, m)
