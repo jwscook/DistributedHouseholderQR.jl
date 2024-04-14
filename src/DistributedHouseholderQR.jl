@@ -198,10 +198,6 @@ end
 function _householder_inner!(H, j, Hj::Vector)
   m, n = size(H)
   Hl = LocalColumnBlock(H)
-  # @batch makes Hj a StridedVector rather than a Vector, and then SIMD can't cope:
-  #@batch per=core minbatch=4 for jj in intersect(j+1:n, Hl.colrange)
-  # FLoops can be used the simd version of the hotloop:
-  #@floop ThreadedEx() for jj in intersect(j+1:n, Hl.colrange)
   jjs = intersect(j+1:n, Hl.colrange)
   isempty(jjs) && return Hl
   nchunk = ceil(Int, length(jjs) / nthreads())
